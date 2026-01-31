@@ -70,7 +70,12 @@ export class ModbusRTU {
   maskWriteRegister(dataAddress: number, andMask: number, orMask: number): Promise<WriteMaskRegisterResult>;
   customFunction(functionCode: number, data: Array<number>): Promise<CustomFunctionResult>;
 
-  on(event: 'close', listener: () => unknown): this;
+  on(event: 'close', listener: (hadError?: unknown, cause?: unknown) => unknown): this;
+  on(event: 'connect', listener: () => unknown): this;
+  on(event: 'reconnecting', listener: (attempt: number, delay: number, cause?: unknown) => unknown): this;
+  on(event: 'reconnect', listener: (attempt: number) => unknown): this;
+  on(event: 'reconnect_failed', listener: (attempt: number, cause?: unknown) => unknown): this;
+  on(event: 'reconnect_error', listener: (attempt: number, cause?: unknown) => unknown): this;
   on(event: 'error', listener: (error: unknown) => unknown): this;
   readDeviceIdentification(deviceIdCode: number, objectId: number): Promise<ReadDeviceIdentificationResult>;
   reportServerID(deviceIdCode: number): Promise<ReportServerIDResult>;
@@ -149,6 +154,13 @@ export interface SerialPortUnixPlatformOptions {
   vtime?: number;
 }
 
+export interface AutoReconnectOptions {
+  maxRetries?: number;
+  minDelay?: number;
+  maxDelay?: number;
+  backoffFactor?: number;
+}
+
 export interface TcpPortOptions extends TcpSocketConnectOpts {
   port: number;
   localAddress?: string;
@@ -157,6 +169,11 @@ export interface TcpPortOptions extends TcpSocketConnectOpts {
   timeout?: number;
   socket?: Socket;
   socketOpts?: SocketConstructorOpts;
+  keepAlive?: boolean;
+  keepAliveInitialDelay?: number;
+  autoReconnect?: boolean | AutoReconnectOptions;
+  reconnect?: boolean | AutoReconnectOptions;
+  reconnectOnTimeout?: boolean | number;
 }
 
 export interface UdpPortOptions {
@@ -169,6 +186,13 @@ export interface TcpRTUPortOptions {
   port?: number;
   localAddress?: string;
   family?: number;
+  timeout?: number;
+  socket?: Socket;
+  keepAlive?: boolean;
+  keepAliveInitialDelay?: number;
+  autoReconnect?: boolean | AutoReconnectOptions;
+  reconnect?: boolean | AutoReconnectOptions;
+  reconnectOnTimeout?: boolean | number;
 }
 
 export interface TelnetPortOptions {

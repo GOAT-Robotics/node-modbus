@@ -110,6 +110,9 @@ const addConnectionAPI = function(Modbus) {
             options = {};
         }
 
+        this._setReconnectOnTimeout(options.reconnectOnTimeout);
+        delete options.reconnectOnTimeout;
+
         // create the TcpPort
         const TcpPort = require("../ports/tcpport");
         if (this._timeout) {
@@ -139,6 +142,9 @@ const addConnectionAPI = function(Modbus) {
         if (typeof options === "undefined") {
             options = {};
         }
+
+        this._setReconnectOnTimeout(options.reconnectOnTimeout);
+        delete options.reconnectOnTimeout;
 
         options.socket = socket;
 
@@ -172,6 +178,9 @@ const addConnectionAPI = function(Modbus) {
             options = {};
         }
 
+        this._setReconnectOnTimeout(options.reconnectOnTimeout);
+        delete options.reconnectOnTimeout;
+
         const TcpRTUBufferedPort = require("../ports/tcprtubufferedport");
         if (this._timeout) {
             options.timeout = this._timeout;
@@ -192,6 +201,9 @@ const addConnectionAPI = function(Modbus) {
         if (typeof options === "undefined") {
             options = {};
         }
+
+        this._setReconnectOnTimeout(options.reconnectOnTimeout);
+        delete options.reconnectOnTimeout;
 
         options.socket = socket;
 

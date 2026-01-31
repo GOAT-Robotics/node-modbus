@@ -33,6 +33,12 @@ const BAD_ADDRESS_ERRNO = "ECONNREFUSED";
 const TRANSACTION_TIMED_OUT_MESSAGE = "Timed out";
 const TRANSACTION_TIMED_OUT_ERRNO = "ETIMEDOUT";
 
+const PORT_CLOSED_MESSAGE = "Port Closed";
+const PORT_CLOSED_ERRNO = "ECONNRESET";
+
+const PORT_RECONNECTING_MESSAGE = "Port Reconnecting";
+const PORT_RECONNECTING_ERRNO = "EAGAIN";
+
 const modbusErrorMessages = [
     "Unknown error",
     "Illegal function (device does not support this read/write function)",
@@ -66,6 +72,21 @@ const TransactionTimedOutError = function() {
     this.name = this.constructor.name;
     this.message = TRANSACTION_TIMED_OUT_MESSAGE;
     this.errno = TRANSACTION_TIMED_OUT_ERRNO;
+};
+
+const PortClosedError = function(cause) {
+    Error.captureStackTrace(this, this.constructor);
+    this.name = this.constructor.name;
+    this.message = PORT_CLOSED_MESSAGE;
+    this.errno = PORT_CLOSED_ERRNO;
+    if (cause) this.cause = cause;
+};
+
+const PortReconnectingError = function() {
+    Error.captureStackTrace(this, this.constructor);
+    this.name = this.constructor.name;
+    this.message = PORT_RECONNECTING_MESSAGE;
+    this.errno = PORT_RECONNECTING_ERRNO;
 };
 
 const SerialPortError = function() {
@@ -265,24 +286,24 @@ function _readFC22(data, next) {
         next(null, { "address": dataAddress, "andMask": andMask, "orMask": orMask });
 }
 
-  /**
-   * Parse the data for a Modbus -
-   * Read Write Multiple Registers (FC=23)
-   *
-   * @param {Buffer} data the data buffer to parse.
-   * @param {Function} next the function to call next.
-   */
-  function _readFC23(data, next) {
+/**
+ * Parse the data for a Modbus -
+ * Read Write Multiple Registers (FC=23)
+ *
+ * @param {Buffer} data the data buffer to parse.
+ * @param {Function} next the function to call next.
+ */
+function _readFC23(data, next) {
     const bytes = data.readInt8(2);
     const values = [];
 
     for (let i = 0; i < bytes; i += 2) {
-      const reg = data.readUInt16BE(3 + i);
-      values.push(reg);
+        const reg = data.readUInt16BE(3 + i);
+        values.push(reg);
     }
 
     if (next) next(null, { data: values });
-  }
+}
 
 /**
  * Parse the data for a Modbus -
@@ -357,7 +378,7 @@ function _writeBufferToPort(buffer, transactionId) {
 
     if (transaction) {
         transaction._timeoutFired = false;
-        transaction._timeoutHandle = _startTimeout(this._timeout, transaction);
+        transaction._timeoutHandle = _startTimeout(this._timeout, transaction, this);
 
         // If in debug mode, stash a copy of the request payload
         if (this._debugEnabled) {
@@ -374,10 +395,11 @@ function _writeBufferToPort(buffer, transactionId) {
  * If the timeout ends before it was cancelled, it will call the callback with an error.
  * @param {number} duration the timeout duration in milliseconds.
  * @param {Function} next the function to call next.
+ * @param {ModbusRTU} modbus the client instance
  * @return {number} The handle of the timeout
  * @private
  */
-function _startTimeout(duration, transaction) {
+function _startTimeout(duration, transaction, modbus) {
     if (!duration) {
         return undefined;
     }
@@ -389,7 +411,12 @@ function _startTimeout(duration, transaction) {
                 err.modbusRequest = transaction.request;
                 err.modbusResponses = transaction.responses;
             }
-            transaction.next(err);
+            const next = transaction.next;
+            transaction.next = null;
+            next(err);
+        }
+        if (modbus) {
+            modbus._onTransactionTimeout();
         }
     }, duration);
 }
@@ -430,6 +457,7 @@ function _onReceive(data) {
     /* What do we do next? */
     const next = function(err, res) {
         if (transaction.next) {
+            modbus._consecutiveTimeouts = 0;
             /* Include request/response data if enabled */
             if (transaction.request && transaction.responses) {
                 if (err) {
@@ -444,7 +472,9 @@ function _onReceive(data) {
             }
 
             /* Pass the data on */
-            return transaction.next(err, res);
+            const cb = transaction.next;
+            transaction.next = null;
+            return cb(err, res);
         }
     };
 
@@ -599,7 +629,7 @@ function _onReceive(data) {
             case 22:
                 _readFC22(data, next);
                 break;
-             case 23:
+            case 23:
                 _readFC23(data, next);
                 break;
             case 43:
@@ -649,9 +679,103 @@ class ModbusRTU extends EventEmitter {
         // Flag to indicate whether debug mode (pass-through of raw
         // request/response) is enabled.
         this._debugEnabled = false;
+        this._reconnectOnTimeout = 0;
+        this._consecutiveTimeouts = 0;
+        this._forcingReconnect = false;
 
         this._onReceive = _onReceive.bind(this);
         this._onError = _onError.bind(this);
+        this._onPortClose = this._onPortClose.bind(this);
+        this._onPortConnect = this._onPortConnect.bind(this);
+        this._onPortReconnecting = this._onPortReconnecting.bind(this);
+        this._onPortReconnect = this._onPortReconnect.bind(this);
+        this._onPortReconnectFailed = this._onPortReconnectFailed.bind(this);
+        this._onPortReconnectError = this._onPortReconnectError.bind(this);
+    }
+
+    _createPortNotOpenError() {
+        if (this._port && this._port.isReconnecting) {
+            return new PortReconnectingError();
+        }
+        return new PortNotOpenError();
+    }
+
+    _setReconnectOnTimeout(value) {
+        if (value === true) {
+            this._reconnectOnTimeout = 1;
+            return;
+        }
+        if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+            this._reconnectOnTimeout = Math.floor(value);
+            return;
+        }
+        this._reconnectOnTimeout = 0;
+    }
+
+    _onTransactionTimeout() {
+        this._consecutiveTimeouts += 1;
+        if (this._reconnectOnTimeout <= 0) return;
+        if (this._consecutiveTimeouts < this._reconnectOnTimeout) return;
+        if (!this._port) return;
+        if (this._port.isReconnecting) return;
+        if (!this._port.isOpen) return;
+        if (this._forcingReconnect) return;
+        if (!this._port.destroy) return;
+
+        this._forcingReconnect = true;
+        this._consecutiveTimeouts = 0;
+
+        try {
+            this._port.destroy();
+        } catch (e) {
+            this._forcingReconnect = false;
+        }
+    }
+
+    _failPendingTransactions(error) {
+        if (Object.keys(this._transactions).length === 0) return;
+        Object.values(this._transactions).forEach((transaction) => {
+            if (!transaction || !transaction.next) return;
+            if (transaction._timeoutHandle) {
+                _cancelTimeout(transaction._timeoutHandle);
+                transaction._timeoutHandle = undefined;
+            }
+            transaction._timeoutFired = true;
+            const next = transaction.next;
+            transaction.next = null;
+            next(error);
+        });
+    }
+
+    _onPortConnect() {
+        if (this._port) {
+            this._port._transactionIdRead = 1;
+            this._port._transactionIdWrite = 1;
+        }
+        this._consecutiveTimeouts = 0;
+        this._forcingReconnect = false;
+        this.emit("connect");
+    }
+
+    _onPortClose(hadError, cause) {
+        this._failPendingTransactions(new PortClosedError(cause));
+        this.emit("close", hadError, cause);
+    }
+
+    _onPortReconnecting(attempt, delay, cause) {
+        this.emit("reconnecting", attempt, delay, cause);
+    }
+
+    _onPortReconnect(attempt) {
+        this.emit("reconnect", attempt);
+    }
+
+    _onPortReconnectFailed(attempt, cause) {
+        this.emit("reconnect_failed", attempt, cause);
+    }
+
+    _onPortReconnectError(attempt, cause) {
+        this.emit("reconnect_error", attempt, cause);
     }
 
     /**
@@ -671,9 +795,7 @@ class ModbusRTU extends EventEmitter {
                 if (callback)
                     callback(error);
             } else {
-                /* init ports transaction id and counter */
-                modbus._port._transactionIdRead = 1;
-                modbus._port._transactionIdWrite = 1;
+                modbus._onPortConnect();
 
                 /* On serial port success
                  * (re-)register the modbus parser functions
@@ -687,8 +809,19 @@ class ModbusRTU extends EventEmitter {
                 modbus._port.removeListener("error", modbus._onError);
                 modbus._port.on("error", modbus._onError);
 
-                /* Hook the close event so we can relay it to our callers. */
-                modbus._port.once("close", modbus.emit.bind(modbus, "close"));
+                /* Hook the connect/close events so we can relay them to our callers. */
+                modbus._port.removeListener("connect", modbus._onPortConnect);
+                modbus._port.on("connect", modbus._onPortConnect);
+                modbus._port.removeListener("close", modbus._onPortClose);
+                modbus._port.on("close", modbus._onPortClose);
+                modbus._port.removeListener("reconnecting", modbus._onPortReconnecting);
+                modbus._port.on("reconnecting", modbus._onPortReconnecting);
+                modbus._port.removeListener("reconnect", modbus._onPortReconnect);
+                modbus._port.on("reconnect", modbus._onPortReconnect);
+                modbus._port.removeListener("reconnect_failed", modbus._onPortReconnectFailed);
+                modbus._port.on("reconnect_failed", modbus._onPortReconnectFailed);
+                modbus._port.removeListener("reconnect_error", modbus._onPortReconnectError);
+                modbus._port.on("reconnect_error", modbus._onPortReconnectError);
 
                 /* On serial port open OK call next function with no error */
                 if (callback)
@@ -752,8 +885,8 @@ class ModbusRTU extends EventEmitter {
      *      or failure.
      */
     destroy(callback) {
-        // cancel all pending requests as we're closing the port
-        this._cancelPendingTransactions();
+        // fail all pending requests as we're destroying the port
+        this._failPendingTransactions(new PortClosedError());
 
         // close the serial port if exist and it has a destroy function
         if (this._port && this._port.destroy) {
@@ -789,7 +922,7 @@ class ModbusRTU extends EventEmitter {
     writeFC2(address, dataAddress, length, next, code) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -848,7 +981,7 @@ class ModbusRTU extends EventEmitter {
     writeFC4(address, dataAddress, length, next, code) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -901,7 +1034,7 @@ class ModbusRTU extends EventEmitter {
     writeFC5(address, dataAddress, state, next) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -952,7 +1085,7 @@ class ModbusRTU extends EventEmitter {
     writeFC6(address, dataAddress, value, next) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -1015,7 +1148,7 @@ class ModbusRTU extends EventEmitter {
     writeFC15(address, dataAddress, array, next) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -1077,7 +1210,7 @@ class ModbusRTU extends EventEmitter {
     writeFC16(address, dataAddress, array, next) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -1137,7 +1270,7 @@ class ModbusRTU extends EventEmitter {
     writeFC17(address, da, l, next) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -1172,7 +1305,7 @@ class ModbusRTU extends EventEmitter {
      */
     writeFC20(address, fileNumber, recordNumber, next) {
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
         // sanity check
@@ -1215,7 +1348,7 @@ class ModbusRTU extends EventEmitter {
      */
     writeFC22(address, dataAddress, andMask, orMask, next) {
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -1243,7 +1376,7 @@ class ModbusRTU extends EventEmitter {
         _writeBufferToPort.call(this, buf, this._port._transactionIdWrite);
     }
 
-      /**
+    /**
      * Write a Modbus "Read/Write Multiple Registers" (FC=23) to serial port.
      *
      * @param {number} address the slave unit address.
@@ -1254,62 +1387,60 @@ class ModbusRTU extends EventEmitter {
      * @param {Array|Buffer} valuesToWrite the array of values or buffer to write to registers.
      * @param {Function} next the function to call next.
      */
-    writeFC23(address, startingReadAddress, numReadRegisters, startingWriteAddress,
-              numWriteRegisters, valuesToWrite, next) {
-      if (this.isOpen !== true) {
-        if (next) next(new PortNotOpenError());
-        return;
-      }
-
-      if (typeof address === "undefined" || typeof startingReadAddress === "undefined" || typeof startingWriteAddress === "undefined") {
-        if (next) next(new BadAddressError());
-        return;
-      }
-
-      if (!Array.isArray(valuesToWrite) && !Buffer.isBuffer(valuesToWrite)) {
-        if (next)
-          next(new Error("Parameter valuesToWrite must be an array or buffer"));
-        return;
-      }
-
-      const code = 23;
-
-      // Calculate byte count for write data (should be numWriteRegisters * 2)
-      const writeByteCount = numWriteRegisters * 2;
-
-      // Expected response length: address(1) + code(1) + byteCount(1) + data(numReadRegisters*2) + crc(2)
-      const responseLength = 3 + numReadRegisters * 2 + 2;
-
-      this._transactions[this._port._transactionIdWrite] = {
-        nextAddress: address,
-        nextCode: code,
-        nextLength: responseLength,
-        next: next,
-      };
-
-      // Request: address(1) + code(1) + readAddr(2) + readQty(2) + writeAddr(2) + writeQty(2) + byteCount(1) + writeData(N*2) + crc(2)
-      const codeLength = 11 + writeByteCount;
-      const buf = Buffer.alloc(codeLength + 2); // add 2 crc bytes
-
-      buf.writeUInt8(address, 0);
-      buf.writeUInt8(code, 1);
-      buf.writeUInt16BE(startingReadAddress, 2);
-      buf.writeUInt16BE(numReadRegisters, 4);
-      buf.writeUInt16BE(startingWriteAddress, 6);
-      buf.writeUInt16BE(numWriteRegisters, 8);
-      buf.writeUInt8(writeByteCount, 10);
-
-      if (Buffer.isBuffer(valuesToWrite)) {
-        valuesToWrite.copy(buf, 11);
-      } else {
-        for (let i = 0; i < numWriteRegisters; i++) {
-          buf.writeUInt16BE(valuesToWrite[i], 11 + 2 * i);
+    writeFC23(address, startingReadAddress, numReadRegisters, startingWriteAddress, numWriteRegisters, valuesToWrite, next) {
+        if (this.isOpen !== true) {
+            if (next) next(this._createPortNotOpenError());
+            return;
         }
-      }
 
-      buf.writeUInt16LE(crc16(buf.slice(0, -2)), codeLength);
-      _writeBufferToPort.call(this, buf, this._port._transactionIdWrite);
-  }
+        if (typeof address === "undefined" || typeof startingReadAddress === "undefined" || typeof startingWriteAddress === "undefined") {
+            if (next) next(new BadAddressError());
+            return;
+        }
+
+        if (!Array.isArray(valuesToWrite) && !Buffer.isBuffer(valuesToWrite)) {
+            if (next) next(new Error("Parameter valuesToWrite must be an array or buffer"));
+            return;
+        }
+
+        const code = 23;
+
+        // Calculate byte count for write data (should be numWriteRegisters * 2)
+        const writeByteCount = numWriteRegisters * 2;
+
+        // Expected response length: address(1) + code(1) + byteCount(1) + data(numReadRegisters*2) + crc(2)
+        const responseLength = 3 + numReadRegisters * 2 + 2;
+
+        this._transactions[this._port._transactionIdWrite] = {
+            nextAddress: address,
+            nextCode: code,
+            nextLength: responseLength,
+            next: next
+        };
+
+        // Request: address(1) + code(1) + readAddr(2) + readQty(2) + writeAddr(2) + writeQty(2) + byteCount(1) + writeData(N*2) + crc(2)
+        const codeLength = 11 + writeByteCount;
+        const buf = Buffer.alloc(codeLength + 2); // add 2 crc bytes
+
+        buf.writeUInt8(address, 0);
+        buf.writeUInt8(code, 1);
+        buf.writeUInt16BE(startingReadAddress, 2);
+        buf.writeUInt16BE(numReadRegisters, 4);
+        buf.writeUInt16BE(startingWriteAddress, 6);
+        buf.writeUInt16BE(numWriteRegisters, 8);
+        buf.writeUInt8(writeByteCount, 10);
+
+        if (Buffer.isBuffer(valuesToWrite)) {
+            valuesToWrite.copy(buf, 11);
+        } else {
+            for (let i = 0; i < numWriteRegisters; i++) {
+                buf.writeUInt16BE(valuesToWrite[i], 11 + 2 * i);
+            }
+        }
+
+        buf.writeUInt16LE(crc16(buf.slice(0, -2)), codeLength);
+        _writeBufferToPort.call(this, buf, this._port._transactionIdWrite);
+    }
 
     /**
      * Write a Modbus "Custom Function Code" (FC=65-72, 100-110) to serial port.
@@ -1321,7 +1452,7 @@ class ModbusRTU extends EventEmitter {
      */
     writeCustomFC(address, functionCode, data, next) {
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 
@@ -1362,7 +1493,7 @@ class ModbusRTU extends EventEmitter {
     writeFC43(address, deviceIdCode, objectId, next) {
         // check port is actually open before attempting write
         if (this.isOpen !== true) {
-            if (next) next(new PortNotOpenError());
+            if (next) next(this._createPortNotOpenError());
             return;
         }
 

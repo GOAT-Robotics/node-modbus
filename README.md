@@ -198,13 +198,39 @@ const ModbusRTU = require("modbus-serial");
 const client = new ModbusRTU();
 
 // open connection to a tcp line
-client.connectTCP("127.0.0.1", { port: 8502 });
+client.connectTCP("127.0.0.1", {
+    port: 8502,
+    // optional: treat inactivity as disconnect (helps detect half-open TCP)
+    // (this is a TCP socket inactivity timeout, not the Modbus request timeout)
+    timeout: 2000,
+    autoReconnect: { maxRetries: Infinity, minDelay: 500, maxDelay: 30000, backoffFactor: 1.5 },
+    // optional: if Modbus requests time out, force a reconnect after N consecutive timeouts
+    // (useful when the connection stays "open" but the slave stopped responding)
+    reconnectOnTimeout: 1
+});
 client.setID(1);
+
+client.on("reconnecting", function(attempt, delay, err) {
+    console.log("reconnecting", { attempt, delay, err });
+});
+client.on("reconnect", function(attempt) {
+    console.log("reconnected", { attempt });
+});
+client.on("reconnect_failed", function(attempt, err) {
+    console.log("reconnect failed", { attempt, err });
+});
 
 // read the values of 10 registers starting at address 0
 // on device number 1. and log the values to the console.
 setInterval(function() {
     client.readHoldingRegisters(0, 10, function(err, data) {
+        if (err) {
+            // during a disconnect/reconnect you will get:
+            // - err.message === "Port Closed" (in-flight request interrupted)
+            // - err.message === "Port Reconnecting" (request attempted while reconnecting)
+            console.error(err);
+            return;
+        }
         console.log(data.data);
     });
 }, 1000);
