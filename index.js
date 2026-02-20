@@ -19,6 +19,7 @@
  */
 require("./utils/buffer_bit")();
 const crc16 = require("./utils/crc16");
+const createActivityLogger = require("./utils/activity_logger");
 const modbusSerialDebug = require("debug")("modbus-serial");
 
 const events = require("events");
@@ -368,6 +369,48 @@ function _readCustomFC(data, _modbus, next) {
         next(null, { "data": contents, "buffer": data.slice(2, 2 + length) });
 }
 
+// function _functionCodeType(functionCode) {
+//     const types = {
+//         1: "readCoils",
+//         2: "readDiscreteInputs",
+//         3: "readHoldingRegisters",
+//         4: "readInputRegisters",
+//         5: "writeCoil",
+//         6: "writeRegister",
+//         15: "writeCoils",
+//         16: "writeRegisters",
+//         17: "reportServerID",
+//         20: "readFileRecords",
+//         22: "maskWriteRegister",
+//         23: "readWriteRegisters",
+//         43: "readDeviceIdentification"
+//     };
+//     return types[functionCode] || "customFunction";
+// }
+
+// function _extractRequestFields(buffer) {
+//     const fields = {};
+//     if (!buffer || buffer.length < 2) return fields;
+//     fields.unitId = buffer[0];
+//     fields.functionCode = buffer[1];
+//     fields.operation = _functionCodeType(buffer[1]);
+
+//     if (buffer.length >= 6) {
+//         fields.dataAddress = buffer.readUInt16BE(2);
+//         fields.quantityOrValue = buffer.readUInt16BE(4);
+//     }
+
+//     return fields;
+// }
+
+function _getPortEndpoint(modbus) {
+    if (!modbus || !modbus._port) return {};
+    if (typeof modbus._port._getEndpointDetails === "function") {
+        return modbus._port._getEndpointDetails();
+    }
+    return {};
+}
+
 /**
  * Wrapper method for writing to a port with timeout. <code><b>[this]</b></code> has the context of ModbusRTU
  * @param {Buffer} buffer The data to send
@@ -375,6 +418,8 @@ function _readCustomFC(data, _modbus, next) {
  */
 function _writeBufferToPort(buffer, transactionId) {
     const transaction = this._transactions[transactionId];
+
+    this._stats.totalRequests += 1;
 
     if (transaction) {
         transaction._timeoutFired = false;
@@ -405,6 +450,14 @@ function _startTimeout(duration, transaction, modbus) {
     }
     return setTimeout(function() {
         transaction._timeoutFired = true;
+        if (modbus) {
+            modbus._stats.totalErrors += 1;
+            modbus._logActivity("warn", "transaction timeout", {
+                ..._getPortEndpoint(modbus),
+                timeoutMs: duration,
+                liveRatio: modbus._getLiveRatio()
+            });
+        }
         if (transaction.next) {
             const err = new TransactionTimedOutError();
             if (transaction.request && transaction.responses) {
@@ -446,6 +499,15 @@ function _onReceive(data) {
 
     // the _transactionIdRead can be missing, ignore wrong transaction it's
     if (!transaction) {
+        let transactionIdRead;
+        if (modbus._port) {
+            transactionIdRead = modbus._port._transactionIdRead;
+        }
+        modbus._logActivity("warn", "orphan response ignored", {
+            ..._getPortEndpoint(modbus),
+            transactionIdRead: transactionIdRead,
+            bytes: data.length
+        });
         return;
     }
 
@@ -458,6 +520,21 @@ function _onReceive(data) {
     const next = function(err, res) {
         if (transaction.next) {
             modbus._consecutiveTimeouts = 0;
+            if (err) {
+                modbus._stats.totalErrors += 1;
+                let transactionId;
+                if (modbus._port) {
+                    transactionId = modbus._port._transactionIdRead;
+                }
+                modbus._logActivity("error", "request failed", {
+                    ..._getPortEndpoint(modbus),
+                    transactionId: transactionId,
+                    error: err.message,
+                    liveRatio: modbus._getLiveRatio()
+                });
+            } else {
+                modbus._stats.totalResponses += 1;
+            }
             /* Include request/response data if enabled */
             if (transaction.request && transaction.responses) {
                 if (err) {
@@ -656,6 +733,17 @@ function _onError(e) {
     const err = new SerialPortError();
     err.message = e.message;
     err.stack = e.stack;
+    if (typeof this._logActivity === "function") {
+        let errorMessage = e;
+        if (e && e.message) {
+            errorMessage = e.message;
+        }
+        this._stats.totalErrors += 1;
+        this._logActivity("error", "port error", {
+            ..._getPortEndpoint(this),
+            error: errorMessage
+        });
+    }
     this.emit("error", err);
 }
 
@@ -664,9 +752,33 @@ class ModbusRTU extends EventEmitter {
      * Class making ModbusRTU calls fun and easy.
      *
      * @param {SerialPort} port the serial port to use.
+     * @param {boolean|object} modbusLogEnabled when true, enable client activity logs.
      */
-    constructor(port) {
+    constructor(port, modbusLogEnabled) {
         super();
+
+        if (typeof port === "boolean" && typeof modbusLogEnabled === "undefined") {
+            modbusLogEnabled = port;
+            port = undefined;
+        }
+
+        if (
+            typeof port === "object" &&
+            port &&
+            typeof modbusLogEnabled === "undefined" &&
+            Object.prototype.hasOwnProperty.call(port, "modbusLogEnabled") &&
+            typeof port.open === "undefined"
+        ) {
+            modbusLogEnabled = port.modbusLogEnabled;
+            port = undefined;
+        }
+
+        let isLogEnabled = false;
+        if (typeof modbusLogEnabled === "object" && modbusLogEnabled) {
+            isLogEnabled = Boolean(modbusLogEnabled.modbusLogEnabled);
+        } else if (typeof modbusLogEnabled !== "undefined") {
+            isLogEnabled = Boolean(modbusLogEnabled);
+        }
 
         // the serial port to use
         this._port = port;
@@ -682,6 +794,16 @@ class ModbusRTU extends EventEmitter {
         this._reconnectOnTimeout = 0;
         this._consecutiveTimeouts = 0;
         this._forcingReconnect = false;
+        this._stats = {
+            totalRequests: 0,
+            totalResponses: 0,
+            totalErrors: 0
+        };
+        this._modbusLogEnabled = isLogEnabled;
+        this._activityLog = createActivityLogger("client", null, {
+            enabled: () => this._modbusLogEnabled
+        });
+        this._logActivity("info", "client initialized");
 
         this._onReceive = _onReceive.bind(this);
         this._onError = _onError.bind(this);
@@ -712,8 +834,37 @@ class ModbusRTU extends EventEmitter {
         this._reconnectOnTimeout = 0;
     }
 
+    _getLiveRatio() {
+        if (this._stats.totalRequests === 0) return "0.00%";
+        const ratio = (this._stats.totalResponses / this._stats.totalRequests) * 100;
+        return `${ratio.toFixed(2)}%`;
+    }
+
+    _logActivity(levelOrEvent, eventOrDetails, maybeDetails) {
+        if (!this._activityLog) return;
+        this._activityLog(levelOrEvent, eventOrDetails, maybeDetails);
+    }
+
+    set modbusLogEnabled(enabled) {
+        this._modbusLogEnabled = Boolean(enabled);
+    }
+
+    get modbusLogEnabled() {
+        return this._modbusLogEnabled;
+    }
+
+    setLogEnabled(enabled) {
+        this.modbusLogEnabled = enabled;
+        return this;
+    }
+
     _onTransactionTimeout() {
         this._consecutiveTimeouts += 1;
+        this._logActivity("warn", "timeout counter incremented", {
+            ..._getPortEndpoint(this),
+            consecutiveTimeouts: this._consecutiveTimeouts,
+            reconnectOnTimeout: this._reconnectOnTimeout
+        });
         if (this._reconnectOnTimeout <= 0) return;
         if (this._consecutiveTimeouts < this._reconnectOnTimeout) return;
         if (!this._port) return;
@@ -724,6 +875,9 @@ class ModbusRTU extends EventEmitter {
 
         this._forcingReconnect = true;
         this._consecutiveTimeouts = 0;
+        this._logActivity("warn", "forcing reconnect after timeout threshold", {
+            ..._getPortEndpoint(this)
+        });
 
         try {
             this._port.destroy();
@@ -754,27 +908,74 @@ class ModbusRTU extends EventEmitter {
         }
         this._consecutiveTimeouts = 0;
         this._forcingReconnect = false;
+        this._logActivity("info", "modbus connection established");
         this.emit("connect");
     }
 
     _onPortClose(hadError, cause) {
+        let causeMessage = cause;
+        if (cause && cause.message) {
+            causeMessage = cause.message;
+        }
         this._failPendingTransactions(new PortClosedError(cause));
+        if (hadError) {
+            this._logActivity("warn", "modbus disconnected", {
+                ..._getPortEndpoint(this),
+                hadError: Boolean(hadError),
+                cause: causeMessage
+            });
+        } else {
+            this._logActivity("info", "modbus disconnected", {
+                ..._getPortEndpoint(this),
+                hadError: Boolean(hadError),
+                cause: causeMessage
+            });
+        }
         this.emit("close", hadError, cause);
     }
 
     _onPortReconnecting(attempt, delay, cause) {
+        let causeMessage = cause;
+        if (cause && cause.message) {
+            causeMessage = cause.message;
+        }
+        this._logActivity("warn", "modbus reconnecting", {
+            ..._getPortEndpoint(this),
+            attempt,
+            delayMs: delay,
+            cause: causeMessage
+        });
         this.emit("reconnecting", attempt, delay, cause);
     }
 
     _onPortReconnect(attempt) {
+        this._logActivity("info", "modbus reconnected", { attempt });
         this.emit("reconnect", attempt);
     }
 
     _onPortReconnectFailed(attempt, cause) {
+        let causeMessage = cause;
+        if (cause && cause.message) {
+            causeMessage = cause.message;
+        }
+        this._logActivity("error", "modbus reconnect failed", {
+            ..._getPortEndpoint(this),
+            attempt,
+            cause: causeMessage
+        });
         this.emit("reconnect_failed", attempt, cause);
     }
 
     _onPortReconnectError(attempt, cause) {
+        let causeMessage = cause;
+        if (cause && cause.message) {
+            causeMessage = cause.message;
+        }
+        this._logActivity("error", "modbus reconnect error", {
+            ..._getPortEndpoint(this),
+            attempt,
+            cause: causeMessage
+        });
         this.emit("reconnect_error", attempt, cause);
     }
 
@@ -786,11 +987,20 @@ class ModbusRTU extends EventEmitter {
      */
     open(callback) {
         const modbus = this;
+        modbus._logActivity("info", "open requested");
 
         // open the serial port
         modbus._port.open(function(error) {
             if (error) {
+                let errorMessage = error;
+                if (error && error.message) {
+                    errorMessage = error.message;
+                }
                 modbusSerialDebug({ action: "port open error", error: error });
+                modbus._logActivity("error", "open failed", {
+                    ..._getPortEndpoint(modbus),
+                    error: errorMessage
+                });
                 /* On serial port open error call next function */
                 if (callback)
                     callback(error);
@@ -824,6 +1034,7 @@ class ModbusRTU extends EventEmitter {
                 modbus._port.on("reconnect_error", modbus._onPortReconnectError);
 
                 /* On serial port open OK call next function with no error */
+                modbus._logActivity("info", "open succeeded");
                 if (callback)
                     callback(error);
             }
@@ -868,6 +1079,7 @@ class ModbusRTU extends EventEmitter {
      *      or failure.
      */
     close(callback) {
+        this._logActivity("info", "close requested");
         // close the serial port if exist
         if (this._port) {
             this._port.removeAllListeners("data");
@@ -885,6 +1097,7 @@ class ModbusRTU extends EventEmitter {
      *      or failure.
      */
     destroy(callback) {
+        this._logActivity("warn", "destroy requested");
         // fail all pending requests as we're destroying the port
         this._failPendingTransactions(new PortClosedError());
 

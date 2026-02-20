@@ -19,6 +19,7 @@ const EventEmitter = events.EventEmitter || events;
 const modbusSerialDebug = require("debug")("modbus-serial");
 const { SerialPort } = require("serialport");
 const ServerSerialPipeHandler = require("./serverserial_pipe_handler");
+const createActivityLogger = require("../utils/activity_logger");
 
 const PORT = "/dev/tty";
 const BAUDRATE = 9600;
@@ -37,6 +38,7 @@ const handlers = require("./servertcp_handler");
  */
 require("../utils/buffer_bit")();
 const crc16 = require("../utils/crc16");
+const activityLog = createActivityLogger("server-serial");
 
 /**
  * Helper function for sending debug objects.
@@ -52,6 +54,7 @@ function _serverDebug(text, unitID, functionCode, responseBuffer) {
     // If no responseBuffer, then assume this is an error
     // o/w assume an action
     if (typeof responseBuffer === "undefined") {
+        activityLog("warn", "server event", { message: text, unitID, functionCode });
         modbusSerialDebug({
             error: text,
             unitID: unitID,
@@ -59,6 +62,12 @@ function _serverDebug(text, unitID, functionCode, responseBuffer) {
         });
 
     } else {
+        activityLog("debug", "server response", {
+            message: text,
+            unitID,
+            functionCode,
+            bytes: responseBuffer.length
+        });
         modbusSerialDebug({
             action: text,
             unitID: unitID,
@@ -127,6 +136,11 @@ function _callbackFactory(unitID, functionCode, sockWriter) {
 function _parseModbusBuffer(requestBuffer, vector, serverUnitID, sockWriter, options) {
     // Check requestBuffer length
     if (!requestBuffer || requestBuffer.length < MIN_LEN) {
+        let requestBufferLength = 0;
+        if (requestBuffer) {
+            requestBufferLength = requestBuffer.length;
+        }
+        activityLog("warn", "invalid request size", { bytes: requestBufferLength });
         modbusSerialDebug("wrong size of request Buffer " + requestBuffer.length);
         return;
     }
@@ -137,16 +151,23 @@ function _parseModbusBuffer(requestBuffer, vector, serverUnitID, sockWriter, opt
 
     // if crc is bad, ignore message
     if (crc !== crc16(requestBuffer.slice(0, -2))) {
+        activityLog("warn", "invalid request crc");
         modbusSerialDebug("wrong CRC of request Buffer");
         return;
     }
 
     // if crc is bad, ignore message
     if (serverUnitID !== 255 && serverUnitID !== unitID) {
+        activityLog("warn", "request ignored due to unit id", { expectedUnitID: serverUnitID, unitID });
         modbusSerialDebug("wrong unitID");
         return;
     }
 
+    activityLog("info", "request received", {
+        unitID,
+        functionCode,
+        bytes: requestBuffer.length
+    });
     modbusSerialDebug("request for function code " + functionCode);
     const cb = _callbackFactory(unitID, functionCode, sockWriter);
 
@@ -247,6 +268,11 @@ class ServerSerial extends EventEmitter {
         // Open errors will be emitted as an error event
         modbus._server.on("error", function(err) {
             console.log("Error: ", err.message);
+            let errorMessage = err;
+            if (err && err.message) {
+                errorMessage = err.message;
+            }
+            activityLog("error", "serial server error", { error: errorMessage });
         });
 
         // create a server unit id
@@ -264,21 +290,25 @@ class ServerSerial extends EventEmitter {
                 // remoteAddress: sock.remoteAddress,
                 // localPort: sock.localPort
             });
+            activityLog("info", "serial server connected");
 
             modbus._server.on("close", function() {
                 modbusSerialDebug({
                     action: "closed"
                 });
+                activityLog("info", "serial server disconnected");
                 modbus.socks.delete(modbus._server);
             });
 
             modbus.emit("initialized");
+            activityLog("info", "serial server initialized");
         });
 
         modbus._server.on("data", function(data) {
             let recvBuffer = Buffer.from([]);
 
             modbusSerialDebug({ action: "socket data", data: data });
+            activityLog("debug", "serial data", { bytes: data.length });
             recvBuffer = Buffer.concat([recvBuffer, data], recvBuffer.length + data.length);
 
             while (recvBuffer.length > ADDR_LEN) {
@@ -296,7 +326,14 @@ class ServerSerial extends EventEmitter {
 
                 const sockWriter = function(err, responseBuffer) {
                     if (err) {
-                        console.error(err, responseBuffer);
+                        let errorMessage = err;
+                        if (err && err.message) {
+                            errorMessage = err.message;
+                        }
+                        activityLog("error", "serial response error", {
+                            error: errorMessage,
+                            hasResponseBuffer: Boolean(responseBuffer)
+                        });
                         modbus.emit("error", err);
                         return;
                     }
@@ -308,6 +345,7 @@ class ServerSerial extends EventEmitter {
 
                         // write to port
                         (options.portResponse || modbus._serverPath).write(responseBuffer);
+                        activityLog("debug", "serial response sent", { bytes: responseBuffer.length });
                     }
                 };
 
@@ -327,6 +365,11 @@ class ServerSerial extends EventEmitter {
 
         modbus._server.on("error", function(err) {
             modbusSerialDebug(JSON.stringify({ action: "socket error", data: err }));
+            let errorMessage = err;
+            if (err && err.message) {
+                errorMessage = err.message;
+            }
+            activityLog("error", "serial socket error", { error: errorMessage });
 
             modbus.emit("socketError", err);
         });
@@ -355,8 +398,10 @@ class ServerSerial extends EventEmitter {
             });
 
             modbusSerialDebug({ action: "close server" });
+            activityLog("info", "serial server close requested");
         } else {
             modbusSerialDebug({ action: "close server", warning: "server already closed" });
+            activityLog("warn", "serial server close ignored", { reason: "server already closed" });
         }
     }
 }

@@ -3,7 +3,7 @@ import { TestPort } from "./TestPort";
 import { PortInfo } from '@serialport/bindings-cpp';
 
 export class ModbusRTU {
-  constructor(port?: any);
+  constructor(port?: any, modbusLogEnabled?: boolean | ModbusLogConfig);
   static TestPort: typeof TestPort
 
   static getPorts(): Promise<PortInfo[]>
@@ -56,6 +56,7 @@ export class ModbusRTU {
   getID(): number;
   setTimeout(duration: number): void;
   getTimeout(): number;
+  setLogEnabled(enabled: boolean): this;
 
   readCoils(dataAddress: number, length: number): Promise<ReadCoilResult>;
   readDiscreteInputs(dataAddress: number, length: number): Promise<ReadCoilResult>;
@@ -81,6 +82,11 @@ export class ModbusRTU {
   reportServerID(deviceIdCode: number): Promise<ReportServerIDResult>;
 
   isOpen: boolean;
+  modbusLogEnabled: boolean;
+}
+
+export interface ModbusLogConfig {
+  modbusLogEnabled?: boolean;
 }
 
 export interface NodeStyleCallback<T> {

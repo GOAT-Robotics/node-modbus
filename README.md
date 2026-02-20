@@ -30,6 +30,29 @@ try these options on npm install to build, if you have problems to install
 
     --unsafe-perm --build-from-source
 
+#### Library logs
+
+Pass `modbusLogEnabled` when creating a client.
+
+```javascript
+const ModbusRTU = require("modbus-serial");
+
+// enable library logs for this client instance only
+const client = new ModbusRTU(undefined, true);
+// or:
+// const client = new ModbusRTU(undefined, { modbusLogEnabled: true });
+```
+
+If `modbusLogEnabled` is `false` (default), client activity logs are not printed.
+
+You can also toggle it at runtime:
+
+```javascript
+client.setLogEnabled(true);
+// ...
+client.setLogEnabled(false);
+```
+
 
 #### What can I do with this module ?
 

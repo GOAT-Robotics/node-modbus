@@ -5,6 +5,7 @@ const net = require("net");
 const modbusSerialDebug = require("debug")("modbus-serial");
 
 const crc16 = require("../utils/crc16");
+const createActivityLogger = require("../utils/activity_logger");
 
 /* TODO: const should be set once, maybe */
 const EXCEPTION_LENGTH = 3;
@@ -80,12 +81,22 @@ class TcpRTUBufferedPort extends EventEmitter {
         this._hadConnected = false;
         this._keepAlive = null;
         this._keepAliveInitialDelay = 1000;
+        this._activityLog = null;
+        this._connectionStats = {
+            attempts: 0,
+            successes: 0,
+            failures: 0
+        };
+        this._connectInFlight = false;
 
         // options
         if(typeof ip === "object") {
             options = ip;
         }
         if (typeof options === "undefined") options = {};
+        const modbusLogEnabled = Boolean(options.modbusLogEnabled);
+        delete options.modbusLogEnabled;
+        this._activityLog = createActivityLogger("tcp-rtu-buffered-port", null, { enabled: modbusLogEnabled });
 
         const reconnectOptions = options.autoReconnect ?? options.reconnect;
         delete options.autoReconnect;
@@ -197,6 +208,8 @@ class TcpRTUBufferedPort extends EventEmitter {
             modbus._hadConnected = true;
             modbus._reconnecting = false;
             modbus._lastError = null;
+            modbus._connectInFlight = false;
+            modbus._connectionStats.successes += 1;
             if (modbus._reconnectTimer) {
                 clearTimeout(modbus._reconnectTimer);
                 modbus._reconnectTimer = null;
@@ -204,6 +217,10 @@ class TcpRTUBufferedPort extends EventEmitter {
             if (modbus._keepAlive && typeof modbus._client.setKeepAlive === "function") {
                 modbus._client.setKeepAlive(true, modbus._keepAliveInitialDelay);
             }
+            modbus._activityLog("info", "tcp connected", {
+                ...modbus._getEndpointDetails(),
+                ...modbus._getConnectionRatioDetails()
+            });
             modbus._safeEmit("connect");
             if (wasReconnecting) {
                 modbus._safeEmit("reconnect", reconnectAttempt);
@@ -215,6 +232,29 @@ class TcpRTUBufferedPort extends EventEmitter {
             const wasOpen = modbus.openFlag;
             modbus.openFlag = false;
             modbusSerialDebug("TCP buffered port: signal close: " + had_error);
+            let lastErrorMessage;
+            if (modbus._lastError && modbus._lastError.message) {
+                lastErrorMessage = modbus._lastError.message;
+            }
+            if (had_error) {
+                if (modbus._connectInFlight) {
+                    modbus._connectionStats.failures += 1;
+                    modbus._connectInFlight = false;
+                }
+                modbus._activityLog("warn", "tcp disconnected", {
+                    ...modbus._getEndpointDetails(),
+                    ...modbus._getConnectionRatioDetails(),
+                    hadError: Boolean(had_error),
+                    error: lastErrorMessage
+                });
+            } else {
+                modbus._activityLog("info", "tcp disconnected", {
+                    ...modbus._getEndpointDetails(),
+                    ...modbus._getConnectionRatioDetails(),
+                    hadError: Boolean(had_error),
+                    error: lastErrorMessage
+                });
+            }
             let closeError = modbus._lastError;
             if (!closeError && had_error) {
                 closeError = new Error("TCP socket closed with error");
@@ -238,6 +278,19 @@ class TcpRTUBufferedPort extends EventEmitter {
         this._handleSocketError = function(error) {
             modbus.openFlag = false;
             modbus._lastError = error;
+            let errorMessage = error;
+            if (error && error.message) {
+                errorMessage = error.message;
+            }
+            if (modbus._connectInFlight) {
+                modbus._connectionStats.failures += 1;
+                modbus._connectInFlight = false;
+            }
+            modbus._activityLog("error", "tcp error", {
+                ...modbus._getEndpointDetails(),
+                ...modbus._getConnectionRatioDetails(),
+                error: errorMessage
+            });
             modbus._safeEmit("error", error);
             modbus._handleCallback(error);
         };
@@ -246,6 +299,14 @@ class TcpRTUBufferedPort extends EventEmitter {
             // Treat socket inactivity timeout as a broken connection.
             // Without this, TCP half-open situations (e.g. link loss) can leave `isOpen` true forever.
             modbusSerialDebug("TcpRTUBufferedPort port: TimedOut");
+            if (modbus._connectInFlight) {
+                modbus._connectionStats.failures += 1;
+                modbus._connectInFlight = false;
+            }
+            modbus._activityLog("warn", "tcp inactivity timeout", {
+                ...modbus._getEndpointDetails(),
+                ...modbus._getConnectionRatioDetails()
+            });
             const err = new Error("TcpRTUBufferedPort Connection Timed Out");
             modbus._lastError = err;
             modbus.openFlag = false;
@@ -270,6 +331,51 @@ class TcpRTUBufferedPort extends EventEmitter {
             this.callback(error);
             this.callback = null;
         }
+    }
+
+    _getEndpointDetails() {
+        const details = {
+            host: this.connectOptions.host,
+            port: this.connectOptions.port
+        };
+
+        if (this._client) {
+            if (typeof this._client.localAddress !== "undefined") {
+                details.localAddress = this._client.localAddress;
+            }
+            if (typeof this._client.localPort !== "undefined") {
+                details.localPort = this._client.localPort;
+            }
+            if (typeof this._client.remoteAddress !== "undefined") {
+                details.remoteAddress = this._client.remoteAddress;
+            }
+            if (typeof this._client.remotePort !== "undefined") {
+                details.remotePort = this._client.remotePort;
+            }
+        }
+
+        return details;
+    }
+
+    _getConnectionRatioDetails() {
+        const attempts = this._connectionStats.attempts;
+        const successes = this._connectionStats.successes;
+        const failures = this._connectionStats.failures;
+        let successRatio = "0.00%";
+        let failureRatio = "0.00%";
+
+        if (attempts > 0) {
+            successRatio = ((successes / attempts) * 100).toFixed(2) + "%";
+            failureRatio = ((failures / attempts) * 100).toFixed(2) + "%";
+        }
+
+        return {
+            connectionAttempts: attempts,
+            connectionSuccesses: successes,
+            connectionFailures: failures,
+            successRatio: successRatio,
+            failureRatio: failureRatio
+        };
     }
 
     _attachSocketHandlers(client) {
@@ -308,6 +414,16 @@ class TcpRTUBufferedPort extends EventEmitter {
 
         if (this._reconnectAttempt >= this._autoReconnect.maxRetries) {
             this._reconnecting = false;
+            let errorMessage;
+            if (this._lastError) {
+                errorMessage = this._lastError.message;
+            }
+            this._activityLog("error", "tcp reconnect failed", {
+                ...this._getEndpointDetails(),
+                ...this._getConnectionRatioDetails(),
+                attempt: this._reconnectAttempt,
+                error: errorMessage
+            });
             this._safeEmit("reconnect_failed", this._reconnectAttempt, this._lastError);
             return;
         }
@@ -315,6 +431,12 @@ class TcpRTUBufferedPort extends EventEmitter {
         this._reconnecting = true;
         this._reconnectAttempt += 1;
         const delay = this._getReconnectDelay(this._reconnectAttempt);
+        this._activityLog("warn", "tcp reconnect scheduled", {
+            ...this._getEndpointDetails(),
+            ...this._getConnectionRatioDetails(),
+            attempt: this._reconnectAttempt,
+            delayMs: delay
+        });
         this._safeEmit("reconnecting", this._reconnectAttempt, delay, this._lastError);
 
         this._reconnectTimer = setTimeout(() => {
@@ -325,6 +447,13 @@ class TcpRTUBufferedPort extends EventEmitter {
 
     _attemptReconnect() {
         if (!this._shouldReconnect()) return;
+        this._connectionStats.attempts += 1;
+        this._connectInFlight = true;
+        this._activityLog("warn", "tcp reconnect attempt", {
+            ...this._getEndpointDetails(),
+            ...this._getConnectionRatioDetails(),
+            attempt: this._reconnectAttempt
+        });
 
         const previousClient = this._client;
         try {
@@ -341,6 +470,20 @@ class TcpRTUBufferedPort extends EventEmitter {
             this._client.connect(this.connectOptions);
         } catch (error) {
             this._lastError = error;
+            let errorMessage = error;
+            if (error && error.message) {
+                errorMessage = error.message;
+            }
+            if (this._connectInFlight) {
+                this._connectionStats.failures += 1;
+                this._connectInFlight = false;
+            }
+            this._activityLog("error", "tcp reconnect attempt failed", {
+                ...this._getEndpointDetails(),
+                ...this._getConnectionRatioDetails(),
+                attempt: this._reconnectAttempt,
+                error: errorMessage
+            });
             this._safeEmit("reconnect_error", this._reconnectAttempt, error);
             this._scheduleReconnect();
         }
@@ -410,6 +553,12 @@ class TcpRTUBufferedPort extends EventEmitter {
         }
         if(this._externalSocket === null) {
             this.callback = callback;
+            this._connectionStats.attempts += 1;
+            this._connectInFlight = true;
+            this._activityLog("info", "tcp connect requested", {
+                ...this._getEndpointDetails(),
+                ...this._getConnectionRatioDetails()
+            });
             this._client.connect(this.connectOptions);
         } else if(this.openFlag) {
             modbusSerialDebug("TcpRTUBuffered port: external socket is opened");
@@ -426,6 +575,9 @@ class TcpRTUBufferedPort extends EventEmitter {
      */
     close(callback) {
         this._closing = true;
+        this._activityLog("info", "tcp close requested", {
+            ...this._getEndpointDetails()
+        });
         if (this._reconnectTimer) {
             clearTimeout(this._reconnectTimer);
             this._reconnectTimer = null;
@@ -442,6 +594,9 @@ class TcpRTUBufferedPort extends EventEmitter {
      */
     destroy(callback) {
         this._closing = true;
+        this._activityLog("warn", "tcp destroy requested", {
+            ...this._getEndpointDetails()
+        });
         if (this._reconnectTimer) {
             clearTimeout(this._reconnectTimer);
             this._reconnectTimer = null;

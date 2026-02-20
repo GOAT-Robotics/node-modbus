@@ -3,6 +3,7 @@ const events = require("events");
 const EventEmitter = events.EventEmitter || events;
 const net = require("net");
 const modbusSerialDebug = require("debug")("modbus-serial");
+const createActivityLogger = require("../utils/activity_logger");
 
 /* TODO: const should be set once, maybe */
 const EXCEPTION_LENGTH = 5;
@@ -26,6 +27,7 @@ class TelnetPort extends EventEmitter {
         this.openFlag = false;
         this.callback = null;
         this._externalSocket = null;
+        this._activityLog = null;
 
         // options
         if(typeof ip === "object") {
@@ -33,6 +35,9 @@ class TelnetPort extends EventEmitter {
             this.ip = options.ip;
         }
         if (typeof options === "undefined") options = {};
+        const modbusLogEnabled = Boolean(options.modbusLogEnabled);
+        delete options.modbusLogEnabled;
+        this._activityLog = createActivityLogger("telnet-port", null, { enabled: modbusLogEnabled });
         this.port = options.port || TELNET_PORT; // telnet server port
 
         // internal buffer
@@ -124,17 +129,37 @@ class TelnetPort extends EventEmitter {
 
         this._client.on("connect", function() {
             self.openFlag = true;
+            self._activityLog("info", "telnet connected", self._getEndpointDetails());
             handleCallback();
         });
 
         this._client.on("close", function(had_error) {
             self.openFlag = false;
+            if (had_error) {
+                self._activityLog("warn", "telnet disconnected", {
+                    ...self._getEndpointDetails(),
+                    hadError: Boolean(had_error)
+                });
+            } else {
+                self._activityLog("info", "telnet disconnected", {
+                    ...self._getEndpointDetails(),
+                    hadError: Boolean(had_error)
+                });
+            }
             handleCallback(had_error);
             self.emit("close");
         });
 
         this._client.on("error", function(had_error) {
             self.openFlag = false;
+            let errorMessage = had_error;
+            if (had_error && had_error.message) {
+                errorMessage = had_error.message;
+            }
+            self._activityLog("error", "telnet error", {
+                ...self._getEndpointDetails(),
+                error: errorMessage
+            });
             handleCallback(had_error);
         });
 
@@ -143,8 +168,33 @@ class TelnetPort extends EventEmitter {
             // i.e. 'false' for "TCP connection timeout" and 'true' for "Modbus response timeout"
             // (this allows to continue Modbus request re-tries without reconnecting TCP).
             modbusSerialDebug("TelnetPort port: TimedOut");
+            self._activityLog("warn", "telnet timeout", self._getEndpointDetails());
             handleCallback(new Error("TelnetPort Connection Timed Out."));
         });
+    }
+
+    _getEndpointDetails() {
+        const details = {
+            host: this.ip,
+            port: this.port
+        };
+
+        if (this._client) {
+            if (typeof this._client.localAddress !== "undefined") {
+                details.localAddress = this._client.localAddress;
+            }
+            if (typeof this._client.localPort !== "undefined") {
+                details.localPort = this._client.localPort;
+            }
+            if (typeof this._client.remoteAddress !== "undefined") {
+                details.remoteAddress = this._client.remoteAddress;
+            }
+            if (typeof this._client.remotePort !== "undefined") {
+                details.remotePort = this._client.remotePort;
+            }
+        }
+
+        return details;
     }
 
     /**
@@ -181,11 +231,14 @@ class TelnetPort extends EventEmitter {
     open(callback) {
         if(this._externalSocket === null) {
             this.callback = callback;
+            this._activityLog("info", "telnet connect requested", this._getEndpointDetails());
             this._client.connect(this.port, this.ip);
         } else if(this.openFlag) {
             modbusSerialDebug("telnet port: external socket is opened");
+            this._activityLog("info", "telnet external socket already open", this._getEndpointDetails());
             callback(); // go ahead to setup existing socket
         } else {
+            this._activityLog("error", "telnet external socket is not open", this._getEndpointDetails());
             callback(new Error("telnet port: external socket is not opened"));
         }
     }
@@ -197,6 +250,7 @@ class TelnetPort extends EventEmitter {
      */
     close(callback) {
         this.callback = callback;
+        this._activityLog("info", "telnet close requested", this._getEndpointDetails());
         this._client.end();
         this.removeAllListeners();
     }
@@ -208,6 +262,7 @@ class TelnetPort extends EventEmitter {
      */
     destroy(callback) {
         this.callback = callback;
+        this._activityLog("warn", "telnet destroy requested", this._getEndpointDetails());
         if (!this._client.destroyed) {
             this._client.destroy();
         }

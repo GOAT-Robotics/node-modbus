@@ -18,6 +18,7 @@ const events = require("events");
 const EventEmitter = events.EventEmitter || events;
 const net = require("net");
 const modbusSerialDebug = require("debug")("modbus-serial");
+const createActivityLogger = require("../utils/activity_logger");
 
 const HOST = "127.0.0.1";
 const UNIT_ID = 255; // listen to all addresses
@@ -34,6 +35,7 @@ const handlers = require("./servertcp_handler");
  */
 require("../utils/buffer_bit")();
 const crc16 = require("../utils/crc16");
+const activityLog = createActivityLogger("server-tcp");
 
 /**
  * Helper function for sending debug objects.
@@ -49,6 +51,7 @@ function _serverDebug(text, unitID, functionCode, responseBuffer) {
     // If no responseBuffer, then assume this is an error
     // o/w assume an action
     if (typeof responseBuffer === "undefined") {
+        activityLog("warn", "server event", { message: text, unitID, functionCode });
         modbusSerialDebug({
             error: text,
             unitID: unitID,
@@ -56,6 +59,12 @@ function _serverDebug(text, unitID, functionCode, responseBuffer) {
         });
 
     } else {
+        activityLog("debug", "server response", {
+            message: text,
+            unitID,
+            functionCode,
+            bytes: responseBuffer.length
+        });
         modbusSerialDebug({
             action: text,
             unitID: unitID,
@@ -126,6 +135,11 @@ function _callbackFactory(unitID, functionCode, sockWriter) {
 function _parseModbusBuffer(requestBuffer, vector, serverUnitID, sockWriter, options) {
     // Check requestBuffer length
     if (!requestBuffer || requestBuffer.length < MBAP_LEN) {
+        let requestBufferLength = 0;
+        if (requestBuffer) {
+            requestBufferLength = requestBuffer.length;
+        }
+        activityLog("warn", "invalid request size", { bytes: requestBufferLength });
         modbusSerialDebug("wrong size of request Buffer " + requestBuffer.length);
         return;
     }
@@ -136,16 +150,23 @@ function _parseModbusBuffer(requestBuffer, vector, serverUnitID, sockWriter, opt
 
     // if crc is bad, ignore message
     if (crc !== crc16(requestBuffer.slice(0, -2))) {
+        activityLog("warn", "invalid request crc");
         modbusSerialDebug("wrong CRC of request Buffer");
         return;
     }
 
     // if crc is bad, ignore message
     if (serverUnitID !== 255 && serverUnitID !== unitID) {
+        activityLog("warn", "request ignored due to unit id", { expectedUnitID: serverUnitID, unitID });
         modbusSerialDebug("wrong unitID");
         return;
     }
 
+    activityLog("info", "request received", {
+        unitID,
+        functionCode,
+        bytes: requestBuffer.length
+    });
     modbusSerialDebug("request for function code " + functionCode);
     const cb = _callbackFactory(unitID, functionCode, sockWriter);
 
@@ -218,12 +239,18 @@ class ServerTCP extends EventEmitter {
         // create a tcp server
         modbus._server = net.createServer();
         modbus._server.on("error", function(error) {
+            let errorMessage = error;
+            if (error && error.message) {
+                errorMessage = error.message;
+            }
+            activityLog("error", "tcp server error", { error: errorMessage });
             modbus.emit("serverError", error);
         });
         modbus._server.listen({
             port: options.port || MODBUS_PORT,
             host: options.host || HOST
         }, function() {
+            activityLog("info", "tcp server initialized", { host: options.host || HOST, port: options.port || MODBUS_PORT });
             modbus.emit("initialized");
         });
 
@@ -243,16 +270,26 @@ class ServerTCP extends EventEmitter {
                 remoteAddress: sock.remoteAddress,
                 localPort: sock.localPort
             });
+            activityLog("info", "tcp client connected", {
+                remoteAddress: sock.remoteAddress,
+                remotePort: sock.remotePort,
+                localPort: sock.localPort
+            });
 
             sock.once("close", function() {
                 modbusSerialDebug({
                     action: "closed"
+                });
+                activityLog("info", "tcp client disconnected", {
+                    remoteAddress: sock.remoteAddress,
+                    remotePort: sock.remotePort
                 });
                 modbus.socks.delete(sock);
             });
 
             sock.on("data", function(data) {
                 modbusSerialDebug({ action: "socket data", data: data });
+                activityLog("debug", "tcp socket data", { bytes: data.length });
                 recvBuffer = Buffer.concat([recvBuffer, data], recvBuffer.length + data.length);
 
                 while(recvBuffer.length > MBAP_LEN) {
@@ -296,6 +333,10 @@ class ServerTCP extends EventEmitter {
 
                             // write to port
                             sock.write(outTcp);
+                            activityLog("debug", "tcp response sent", {
+                                bytes: outTcp.length,
+                                transactionId: transactionsId
+                            });
                         }
                     };
 
@@ -315,6 +356,11 @@ class ServerTCP extends EventEmitter {
 
             sock.on("error", function(err) {
                 modbusSerialDebug(JSON.stringify({ action: "socket error", data: err }));
+                let errorMessage = err;
+                if (err && err.message) {
+                    errorMessage = err.message;
+                }
+                activityLog("error", "tcp socket error", { error: errorMessage });
 
                 modbus.emit("socketError", err);
             });
@@ -339,8 +385,10 @@ class ServerTCP extends EventEmitter {
             });
 
             modbusSerialDebug({ action: "close server" });
+            activityLog("info", "tcp server close requested");
         } else {
             modbusSerialDebug({ action: "close server", warning: "server already closed" });
+            activityLog("warn", "tcp server close ignored", { reason: "server already closed" });
         }
     }
 }
