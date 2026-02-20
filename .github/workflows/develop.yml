@@ -5,6 +5,8 @@ on:
     branches: [develop]
   pull_request:
     branches: [develop]
+  release:
+    types: [published]
   workflow_dispatch:
 
 jobs:
@@ -32,3 +34,39 @@ jobs:
 
       - name: Run tests
         run: npm run test
+
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+          scope: '@goat-robotics'
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Show version (debug)
+        run: node -p "require('./package.json').version"
+
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
